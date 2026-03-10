@@ -7,6 +7,7 @@ import pywhatkit
 import edge_tts
 import pygame
 import os
+import re
 import time
 import json
 import datetime
@@ -24,11 +25,17 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
 
+# ── Browser agent ──
+from playwright.sync_api import sync_playwright, Playwright, Browser, Page
+
+# ── Reminder scheduler ──
+from apscheduler.schedulers.background import BackgroundScheduler
+
 load_dotenv()
 
 # ================= CONFIGURATION =================
 HF_TOKEN    = os.getenv("HF_TOKEN")
-BRAIN_MODEL = "moonshotai/Kimi-K2-Thinking"
+BRAIN_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 
 # ── Memory paths — E:\optimus\memory\ ──
 MEMORY_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
@@ -59,6 +66,8 @@ HUD_PALETTES = {
     "PROCESSING":  {"primary": "#ffd500", "secondary": "#aa8800", "dark": "#443300", "visor": "#ffd500", "glow": "#665500"},
     "SPEAKING":    {"primary": "#00ff9c", "secondary": "#00aa66", "dark": "#003322", "visor": "#00ff9c", "glow": "#004433"},
     "REMEMBERING": {"primary": "#cc44ff", "secondary": "#880099", "dark": "#220033", "visor": "#cc44ff", "glow": "#440066"},
+    "BROWSING":    {"primary": "#ff6600", "secondary": "#aa3300", "dark": "#331100", "visor": "#ff6600", "glow": "#662200"},
+    "REMINDER":    {"primary": "#ff44aa", "secondary": "#aa0066", "dark": "#330022", "visor": "#ff44aa", "glow": "#660033"},
 }
 
 # ── Pixel art — extracted from reference image ──
@@ -259,6 +268,284 @@ class OptimusMemory:
 MEMORY = OptimusMemory()
 
 
+# =================================================================
+# BROWSER AGENT
+# Playwright-powered — persistent session, LLM-driven actions
+# =================================================================
+class BrowserAgent:
+    def __init__(self):
+        self._playwright = None
+        self._browser    = None
+        self._page       = None
+        self._lock       = threading.Lock()
+
+    def _ensure_browser(self):
+        """Launch browser if not already open."""
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        if self._browser is None or not self._browser.is_connected():
+            self._browser = self._playwright.chromium.launch(
+                headless=False,
+                channel="chrome",   # uses installed Chrome; change to "" for bundled Chromium
+                args=["--start-maximized"]
+            )
+        if self._page is None or self._page.is_closed():
+            ctx = self._browser.new_context(no_viewport=True)
+            self._page = ctx.new_page()
+
+    def is_open(self) -> bool:
+        return (self._browser is not None and
+                self._browser.is_connected() and
+                self._page is not None and
+                not self._page.is_closed())
+
+    def close(self):
+        try:
+            if self._page:    self._page.close()
+            if self._browser: self._browser.close()
+            if self._playwright: self._playwright.stop()
+        except: pass
+        finally:
+            self._playwright = None
+            self._browser    = None
+            self._page       = None
+
+    def get_page_context(self) -> str:
+        """Return current URL + page title + visible text (truncated)."""
+        if not self.is_open():
+            return "No browser open."
+        try:
+            url   = self._page.url
+            title = self._page.title()
+            # Grab visible text — first 2000 chars is enough for LLM context
+            text  = self._page.inner_text("body")[:2000].replace("\n", " ").strip()
+            return f"URL: {url}\nTitle: {title}\nContent: {text}"
+        except:
+            return f"URL: {self._page.url if self._page else 'unknown'}"
+
+    def execute_plan(self, client: InferenceClient, command: str, ui_ref=None) -> str:
+        """
+        LLM generates a step-by-step JSON action plan.
+        We execute each action via Playwright.
+        """
+        with self._lock:
+            self._ensure_browser()
+            page_ctx = self.get_page_context()
+
+            # Ask LLM to produce an action plan
+            plan_prompt = f"""You are a browser automation agent controlling a real browser via Playwright.
+Current browser state:
+{page_ctx}
+
+User command: "{command}"
+
+Produce a JSON array of actions to fulfill this command. Each action is an object with:
+  "action": one of [navigate, click, type, press, scroll, wait, click_nth, done]
+  "value": the argument
+  "description": what this step does (short, plain English)
+
+IMPORTANT RULES:
+- For YouTube search: navigate to https://www.youtube.com/results?search_query=QUERY (URL encode spaces as +)
+  Example: search "lofi music" → navigate to https://www.youtube.com/results?search_query=lofi+music
+  This is ALWAYS more reliable than typing in the search box.
+- For Google search: navigate to https://www.google.com/search?q=QUERY (URL encode spaces as +)
+- For clicking nth YouTube video: use action "click_nth" with value as the number (1-based)
+- For clicking a specific result: use action "click" with the link text or partial title
+- To scroll down: action "scroll" value "500"
+- Always end with action "done" with a confirmation in description
+- Keep steps minimal — prefer direct URL navigation over typing
+
+Respond ONLY with valid JSON array, no markdown, no explanation."""
+
+            try:
+                resp = client.chat_completion(
+                    model="Qwen/Qwen2.5-72B-Instruct",
+                    messages=[{"role": "user", "content": plan_prompt}],
+                    max_tokens=600, temperature=0.2
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"```json|```", "", raw).strip()
+                plan = json.loads(raw)
+            except Exception as e:
+                print(f"[Browser] Plan generation failed: {e}")
+                return "I couldn't figure out the browser steps for that, sir."
+
+            print(f"[Browser] Plan: {json.dumps(plan, indent=2)}")
+
+            last_description = "Done."
+            for step in plan:
+                action = step.get("action", "")
+                value  = step.get("value",  "")
+                desc   = step.get("description", "")
+                print(f"[Browser] Executing: {action} → {value}")
+
+                try:
+                    if action == "navigate":
+                        self._page.goto(str(value), wait_until="domcontentloaded", timeout=20000)
+                        self._page.wait_for_timeout(2000)
+
+                    elif action == "click":
+                        try:
+                            self._page.get_by_text(str(value), exact=False).first.click(timeout=5000)
+                        except:
+                            self._page.click(str(value), timeout=5000)
+                        self._page.wait_for_timeout(1000)
+
+                    elif action == "click_nth":
+                        n = int(value) - 1
+                        clicked = False
+                        # Try YouTube video renderers first
+                        for selector in [
+                            "ytd-video-renderer #video-title",
+                            "ytd-video-renderer a#video-title",
+                            "a#video-title-link",
+                            "ytd-rich-item-renderer #video-title",
+                        ]:
+                            items = self._page.query_selector_all(selector)
+                            if items and n < len(items):
+                                items[n].scroll_into_view_if_needed()
+                                items[n].click()
+                                clicked = True
+                                break
+                        if not clicked:
+                            # Generic fallback — visible links
+                            links = [l for l in self._page.query_selector_all("a[href]") if l.is_visible()]
+                            if n < len(links):
+                                links[n].click()
+                        self._page.wait_for_timeout(1500)
+
+                    elif action == "type":
+                        if "|||" in str(value):
+                            selector, text = str(value).split("|||", 1)
+                            self._page.fill(selector.strip(), text.strip())
+                        else:
+                            self._page.keyboard.type(str(value))
+                        self._page.wait_for_timeout(400)
+
+                    elif action == "press":
+                        self._page.keyboard.press(str(value))
+                        self._page.wait_for_timeout(1200)
+
+                    elif action == "scroll":
+                        px = int(value) if str(value).lstrip("-").isdigit() else 500
+                        self._page.mouse.wheel(0, px)
+                        self._page.wait_for_timeout(500)
+
+                    elif action == "wait":
+                        ms = int(value) if str(value).isdigit() else 1500
+                        self._page.wait_for_timeout(ms)
+
+                    elif action == "done":
+                        last_description = desc or "Done."
+                        break
+
+                except Exception as e:
+                    print(f"[Browser] Step failed ({action}={value}): {e}")
+                    continue
+
+            return last_description
+
+
+# Shared global browser agent
+BROWSER = BrowserAgent()
+
+
+# =================================================================
+# REMINDER SYSTEM
+# APScheduler — parses time from voice, fires notification + TTS
+# =================================================================
+class ReminderSystem:
+    def __init__(self):
+        self.scheduler  = BackgroundScheduler(timezone="Asia/Kolkata")
+        self.scheduler.start()
+        self._speak_fn  = None   # set by UI after init
+        self._ui_ref    = None
+        self._reminders = []     # list of {id, text, time}
+        print("[Reminders] Scheduler started.")
+
+    def set_speak(self, fn, ui_ref):
+        self._speak_fn = fn
+        self._ui_ref   = ui_ref
+
+    def parse_time(self, client: InferenceClient, command: str) -> dict | None:
+        """Ask LLM to extract reminder text and time from natural language."""
+        prompt = f"""Extract the reminder details from this command: "{command}"
+
+Respond ONLY with a JSON object (no markdown):
+{{
+  "reminder_text": "what to remind",
+  "remind_at": "HH:MM"  (24-hour format, today's date assumed)
+}}
+
+If no specific time found, set remind_at to null.
+Current time is {datetime.datetime.now().strftime('%H:%M')}."""
+        try:
+            resp = client.chat_completion(
+                model="Qwen/Qwen2.5-72B-Instruct",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100, temperature=0.1
+            )
+            raw  = resp.choices[0].message.content.strip()
+            raw  = re.sub(r"```json|```", "", raw).strip()
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[Reminder] Parse failed: {e}")
+            return None
+
+    def add(self, reminder_text: str, remind_at: str) -> str:
+        """Schedule a reminder. remind_at = 'HH:MM'"""
+        try:
+            now      = datetime.datetime.now()
+            h, m     = map(int, remind_at.split(":"))
+            fire_dt  = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if fire_dt <= now:
+                fire_dt += datetime.timedelta(days=1)  # next day if time passed
+
+            job_id = f"reminder_{int(fire_dt.timestamp())}"
+            self.scheduler.add_job(
+                self._fire,
+                trigger="date",
+                run_date=fire_dt,
+                args=[reminder_text],
+                id=job_id,
+                replace_existing=True
+            )
+            self._reminders.append({"id": job_id, "text": reminder_text, "time": remind_at})
+            return f"Got it. I'll remind you to {reminder_text} at {remind_at}."
+        except Exception as e:
+            print(f"[Reminder] Schedule failed: {e}")
+            return "I had trouble setting that reminder, sir."
+
+    def _fire(self, reminder_text: str):
+        """Called by scheduler at reminder time."""
+        print(f"[Reminder] FIRING: {reminder_text}")
+        # Show Windows toast notification
+        try:
+            from win10toast import ToastNotifier
+            ToastNotifier().show_toast(
+                "Optimus Reminder",
+                reminder_text,
+                duration=10,
+                threaded=True
+            )
+        except: pass
+        # Speak it out loud
+        if self._speak_fn and self._ui_ref:
+            self._ui_ref.status_text = "REMINDER"
+            self._speak_fn(f"Sir, reminder: {reminder_text}")
+
+    def list_reminders(self) -> str:
+        if not self._reminders:
+            return "No reminders set."
+        lines = [f"{r['time']} — {r['text']}" for r in self._reminders]
+        return "Your reminders: " + ". ".join(lines)
+
+
+# Shared global reminder system
+REMINDERS = ReminderSystem()
+
+
+
 # ── Category detection ──
 def _memory_category(text: str) -> str:
     t = text.lower()
@@ -272,11 +559,34 @@ def _memory_category(text: str) -> str:
     return "general"
 
 
+# ── Browser intent detection ──
+def _wants_browser(text: str) -> bool:
+    t = text.lower()
+    # Explicit browser commands
+    if any(w in t for w in ["open chrome", "open brave", "open edge", "open browser",
+                              "open firefox", "close browser", "close chrome",
+                              "go to", "navigate to", "open website"]):
+        return True
+    # Follow-up browser actions when browser is already open
+    if BROWSER.is_open() and any(w in t for w in [
+        "search", "click", "scroll", "go back", "refresh", "open", "play",
+        "type", "find", "show me", "first", "second", "third", "nth"
+    ]):
+        return True
+    return False
+
+# ── Reminder intent detection ──
+def _wants_reminder(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in ["remind me", "reminder", "set a reminder",
+                                  "note down", "don't let me forget",
+                                  "alert me", "tell me at", "notify me"])
+
 # ── Recall intent detection ──
 def _wants_recall(text: str) -> bool:
     t = text.lower()
-    return any(w in t for w in ["remember", "recall", "do you remember", "what did we",
-                                 "last time", "previously", "earlier we", "before you",
+    return any(w in t for w in ["do you remember", "what did we",
+                                 "last time", "previously", "earlier we",
                                  "we talked", "you told me", "i told you", "history"])
 
 
@@ -307,13 +617,27 @@ class OptimusAgent:
 
     def router(self, state: AgentState) -> AgentState:
         cmd = state["current_command"].lower()
-        # Memory triggers — check first
+        # Memory triggers
         if _wants_recall(cmd):
             return {**state, "next_step": "recall"}
         if any(w in cmd for w in ["remember this", "save this", "remember that",
-                                   "save that", "don't forget", "note that",
+                                   "save that", "don't forget this", "note that",
                                    "memory stats", "how many memories"]):
             return {**state, "next_step": "memory_save"}
+        # Reminder
+        if _wants_reminder(cmd):
+            return {**state, "next_step": "reminder"}
+        if any(w in cmd for w in ["list reminders", "show reminders", "what are my reminders"]):
+            return {**state, "next_step": "reminder"}
+        # ── Browser agent ──
+        # If browser is already open → ALL commands go to browser agent
+        # EXCEPT explicit app/media/memory commands above
+        if BROWSER.is_open():
+            return {**state, "next_step": "browser"}
+        # Browser launch commands
+        if _wants_browser(cmd):
+            return {**state, "next_step": "browser"}
+        # Standard tools (only reached when browser is NOT open)
         if any(w in cmd for w in ["search", "who is", "what is", "tell me about", "look up"]):
             return {**state, "next_step": "search"}
         if any(w in cmd for w in ["skip", "next song", "pause", "play music", "stop music"]):
@@ -325,6 +649,34 @@ class OptimusAgent:
         if any(w in cmd for w in ["play", "song", "music", "youtube"]):
             return {**state, "next_step": "play"}
         return {**state, "next_step": "chat"}
+
+    def browser_node(self, state: AgentState) -> AgentState:
+        cmd = state["current_command"].lower()
+        ui  = getattr(self, "_ui_ref", None)
+        # Close browser
+        if any(w in cmd for w in ["close browser", "close chrome", "close brave", "close edge"]):
+            BROWSER.close()
+            MEMORY.store(cmd, "Browser closed.", "general")
+            return {**state, "response_text": "Browser closed, sir."}
+        # Execute browser plan
+        if ui: ui.status_text = "BROWSING"
+        result = BROWSER.execute_plan(self.client, state["current_command"], ui)
+        MEMORY.store(state["current_command"], result, "general")
+        return {**state, "response_text": result}
+
+    def reminder_node(self, state: AgentState) -> AgentState:
+        cmd = state["current_command"].lower()
+        # List reminders
+        if any(w in cmd for w in ["list", "show", "what are"]):
+            return {**state, "response_text": REMINDERS.list_reminders()}
+        # Parse and schedule
+        parsed = REMINDERS.parse_time(self.client, state["current_command"])
+        if not parsed or not parsed.get("remind_at"):
+            return {**state, "response_text": "I couldn't figure out the time for that reminder. Could you say it again with a specific time?"}
+        response = REMINDERS.add(parsed["reminder_text"], parsed["remind_at"])
+        MEMORY.store(state["current_command"], response, "general")
+        return {**state, "response_text": response}
+
 
     def chat_node(self, state: AgentState) -> AgentState:
         lang_map = {"en": "English", "hi": "Hindi", "gu": "Gujarati"}
@@ -406,17 +758,12 @@ class OptimusAgent:
 
         elif action == "open_app":
             messages = [
-                {"role": "system", "content": "Extract only the app name. Reply with just the name."},
+                {"role": "system", "content": "Extract only the app name from the command. Reply with just the app name, nothing else. Examples: 'brave', 'chrome', 'spotify', 'vs code', 'whatsapp', 'file explorer'"},
                 {"role": "user",   "content": cmd}
             ]
             app_name = self._ask(messages, max_tokens=20).lower().strip()
-            try:
-                if "youtube" in app_name: webbrowser.open("https://www.youtube.com")
-                else: open_app(app_name, match_closest=True, output=False)
-                response = f"Opening {app_name}."
-            except:
-                response = f"Couldn't open {app_name}."
-            MEMORY.store(cmd, response, "general")          # ✅ auto-save
+            response = _launch_app(app_name, cmd)
+            MEMORY.store(cmd, response, "general")
             return {**state, "response_text": response}
 
         elif action == "play":
@@ -437,6 +784,109 @@ class OptimusAgent:
             return {**state, "response_text": "WhatsApp integration coming soon, sir."}
 
         return {**state, "response_text": "Done."}
+
+
+# ================= APP LAUNCHER =================
+# Maps voice keywords → exact AppOpener registry names
+APP_NAME_MAP = {
+    # Browsers
+    "brave":          "brave",
+    "chrome":         "google chrome",
+    "google chrome":  "google chrome",
+    "edge":           "microsoft edge",
+    "microsoft edge": "microsoft edge",
+    # Code editors / IDEs
+    "vs code":        "visual studio code",
+    "vscode":         "visual studio code",
+    "code":           "visual studio code",
+    "pycharm":        "pycharm community edition",
+    "android studio": "android studio",
+    "intellij":       "intellij idea community edition",
+    "spyder":         "spyder",
+    "jupyter":        "jupyter notebook",
+    # Terminals
+    "terminal":       "terminal",
+    "powershell":     "windows powershell",
+    "cmd":            "command prompt",
+    "command prompt": "command prompt",
+    "git bash":       "git bash",
+    # Office / productivity
+    "word":           "word",
+    "excel":          "excel",
+    "powerpoint":     "powerpoint",
+    "outlook":        "outlook",
+    "onenote":        "onenote",
+    "notepad":        "notepad",
+    "sticky notes":   "sticky notes",
+    "to do":          "microsoft to do",
+    "todo":           "microsoft to do",
+    "calendar":       "calendar",
+    "mail":           "mail",
+    # Media
+    "vlc":            "vlc media player",
+    "media player":   "media player",
+    "spotify":        "spotify",
+    "capcut":         "capcut",
+    # Utilities
+    "calculator":     "calculator",
+    "file explorer":  "file explorer",
+    "explorer":       "file explorer",
+    "task manager":   "task manager",
+    "settings":       "settings",
+    "paint":          "paint",
+    "camera":         "camera",
+    "whatsapp":       "whatsapp",
+    "discord":        "discord",
+    "telegram":       "telegram",
+    # Dev tools
+    "mongodb":        "mongodb compass",
+    "mysql":          "mysql workbench ce",
+    "laragon":        "laragon",
+    "anaconda":       "anaconda navigator",
+    "winrar":         "winrar",
+    "proton vpn":     "proton vpn",
+    "vpn":            "proton vpn",
+}
+
+# Web shortcuts — open in default browser
+WEB_REGISTRY = {
+    "youtube":    "https://www.youtube.com",
+    "gmail":      "https://mail.google.com",
+    "github":     "https://www.github.com",
+    "linkedin":   "https://www.linkedin.com",
+    "twitter":    "https://www.twitter.com",
+    "x.com":      "https://www.x.com",
+    "google":     "https://www.google.com",
+    "instagram":  "https://www.instagram.com",
+    "chatgpt":    "https://chat.openai.com",
+    "whatsapp web": "https://web.whatsapp.com",
+}
+
+def _launch_app(app_name: str, original_cmd: str) -> str:
+    combined = f"{app_name} {original_cmd}".lower()
+
+    # 1. Web shortcuts
+    for key, url in WEB_REGISTRY.items():
+        if key in combined:
+            webbrowser.open(url)
+            return f"Opening {key}."
+
+    # 2. Exact name map → AppOpener
+    for keyword, exact_name in APP_NAME_MAP.items():
+        if keyword in combined:
+            try:
+                open_app(exact_name, match_closest=False, output=False)
+                return f"Opening {exact_name}."
+            except Exception as e:
+                print(f"[AppLaunch] {exact_name} failed: {e}")
+                return f"Couldn't open {exact_name}."
+
+    # 3. Fallback — let AppOpener guess
+    try:
+        open_app(app_name, match_closest=True, output=False)
+        return f"Opening {app_name}."
+    except:
+        return f"I don't know how to open '{app_name}'."
 
 
 # ================= LANGUAGE DETECTOR =================
@@ -514,26 +964,33 @@ class OptimusV2(ctk.CTk):
 
     def setup_graph(self):
         agent    = OptimusAgent()
-        agent._ui_ref = self          # give agent a ref so memory_save can grab last exchange
+        agent._ui_ref = self
         workflow = StateGraph(AgentState)
         workflow.add_node("router",      agent.router)
         workflow.add_node("chat",        agent.chat_node)
         workflow.add_node("tools",       agent.tool_node)
         workflow.add_node("recall",      agent.recall_node)
         workflow.add_node("memory_save", agent.memory_save_node)
+        workflow.add_node("browser",     agent.browser_node)
+        workflow.add_node("reminder",    agent.reminder_node)
         workflow.set_entry_point("router")
         workflow.add_conditional_edges(
             "router",
             lambda state: state["next_step"],
             {"chat": "chat", "recall": "recall", "memory_save": "memory_save",
+             "browser": "browser", "reminder": "reminder",
              "search": "tools", "media": "tools",
              "open_app": "tools", "play": "tools", "whatsapp": "tools"}
         )
         workflow.add_edge("chat",        END)
         workflow.add_edge("recall",      END)
         workflow.add_edge("memory_save", END)
+        workflow.add_edge("browser",     END)
+        workflow.add_edge("reminder",    END)
         workflow.add_edge("tools",       END)
         self.app_graph = workflow.compile()
+        # Connect reminder system to UI speak
+        REMINDERS.set_speak(self.speak, self)
 
     def animate_hud(self):
         self.pulse += self.pulse_dir
@@ -542,7 +999,7 @@ class OptimusV2(ctk.CTk):
 
         palette = HUD_PALETTES.get(self.status_text, HUD_PALETTES["STANDBY_EN"])
         self.canvas.delete("all")
-        pulse_val = self.pulse if self.status_text in ("LISTENING", "SPEAKING", "REMEMBERING") else 0
+        pulse_val = self.pulse if self.status_text in ("LISTENING", "SPEAKING", "REMEMBERING", "BROWSING", "REMINDER") else 0
         draw_optimus_head(self.canvas, cx=220, cy=255, palette=palette, pulse=pulse_val)
 
         display = self.status_text.replace("STANDBY_", "").replace("_", " ")
@@ -555,21 +1012,45 @@ class OptimusV2(ctk.CTk):
         recognizer.dynamic_energy_threshold = True
         recognizer.pause_threshold          = 0.8
 
+        WAKE_WORDS      = ["optimus", "optimum", "optimas", "hey optimus"]  # common misheards too
+        ACTIVE_TIMEOUT  = 45       # seconds to stay active after wake word
+        ACTIVE_WINDOW   = 8        # phrase_time_limit while active
+
         with sr.Microphone() as source:
             recognizer.adjust_for_ambient_noise(source, duration=1.0)
-            print("[Optimus] Always-on listening started.")
+            print("[Optimus] Wake word mode — say 'Optimus' to activate.")
+
+            active        = False
+            active_until  = 0
+            greeted       = False   # only full greeting on first wake of session
 
             while True:
                 if self.is_processing or self.status_text == "SPEAKING":
                     time.sleep(0.2)
                     continue
-                try:
+
+                # Check if active window expired
+                if active and time.time() > active_until:
+                    active = False
                     self.status_text = f"STANDBY_{self.current_lang.upper()}"
-                    audio = recognizer.listen(source, timeout=None, phrase_time_limit=12)
+                    print("[Optimus] Active window expired — back to wake word mode.")
+                    self.speak("Going standby, sir.")
 
+                try:
+                    if active:
+                        # Active mode — short timeout to catch commands quickly
+                        audio = recognizer.listen(source, timeout=ACTIVE_TIMEOUT,
+                                                  phrase_time_limit=ACTIVE_WINDOW)
+                    else:
+                        # Wake word mode — wait forever, short phrase window
+                        self.status_text = f"STANDBY_{self.current_lang.upper()}"
+                        audio = recognizer.listen(source, timeout=None,
+                                                  phrase_time_limit=4)
+
+                    # Transcribe
                     best_text, best_lang = None, self.current_lang
-                    lang_order = [self.current_lang] + [l for l in ["en","hi","gu"] if l != self.current_lang]
-
+                    lang_order = [self.current_lang] + [l for l in ["en","hi","gu"]
+                                                        if l != self.current_lang]
                     for lang in lang_order:
                         try:
                             text = recognizer.recognize_google(audio, language=LANG_CODES[lang])
@@ -583,16 +1064,51 @@ class OptimusV2(ctk.CTk):
                         except:
                             continue
 
-                    if best_text:
-                        if best_lang != self.current_lang:
-                            print(f"[Auto-lang] Switched to {best_lang}")
-                            self.current_lang = best_lang
-                            self.after(0, self.update_lang_buttons)
-                        print(f"[Heard] ({best_lang}) {best_text}")
-                        self.process_command(best_text)
+                    if not best_text:
+                        continue
+
+                    # ── Wake word check ──
+                    is_wake = any(w in best_text for w in WAKE_WORDS)
+
+                    if not active:
+                        if is_wake:
+                            active       = True
+                            active_until = time.time() + ACTIVE_TIMEOUT
+                            self.status_text = "LISTENING"
+                            print(f"[Optimus] Wake word detected — active for {ACTIVE_TIMEOUT}s")
+                            if not greeted:
+                                greeted = True
+                                self.speak("Optimus online. How can I help you, sir?")
+                            else:
+                                self.speak("Yes sir?")
+                        # Not active + no wake word → ignore completely
+                        continue
+
+                    # ── Active mode ──
+                    # Reset timer on any speech
+                    active_until = time.time() + ACTIVE_TIMEOUT
+
+                    # If they said wake word again while active → just acknowledge
+                    if is_wake and len(best_text.split()) <= 3:
+                        self.speak("I'm listening.")
+                        continue
+
+                    # Update lang if switched
+                    if best_lang != self.current_lang:
+                        print(f"[Auto-lang] Switched to {best_lang}")
+                        self.current_lang = best_lang
+                        self.after(0, self.update_lang_buttons)
+
+                    print(f"[Heard] ({best_lang}) {best_text}")
+                    self.process_command(best_text)
 
                 except sr.WaitTimeoutError:
-                    pass
+                    # Active window timed out from sr side too
+                    if active:
+                        active = False
+                        self.status_text = f"STANDBY_{self.current_lang.upper()}"
+                        print("[Optimus] No command heard — going standby.")
+                        self.speak("Going standby.")
                 except Exception as e:
                     print(f"[Listen Error] {e}")
                     time.sleep(0.5)
@@ -601,8 +1117,14 @@ class OptimusV2(ctk.CTk):
         if self.is_processing:
             return
         self.is_processing = True
-        self.status_text = "REMEMBERING" if (_wants_recall(command) or
-                           any(w in command.lower() for w in ["remember this","save this","remember that","save that","don't forget","note that"])) else "PROCESSING"
+        if _wants_recall(command) or any(w in command.lower() for w in ["remember this","save this","remember that","save that","don't forget this","note that"]):
+            self.status_text = "REMEMBERING"
+        elif _wants_reminder(command):
+            self.status_text = "REMINDER"
+        elif _wants_browser(command):
+            self.status_text = "BROWSING"
+        else:
+            self.status_text = "PROCESSING"
 
         def _run():
             try:
