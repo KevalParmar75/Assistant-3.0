@@ -325,17 +325,28 @@ class OptimusApp(ctk.CTk):
                 agent  = result.get("active_agent", "chat")
                 reply  = result.get("response", "")
 
-                # Auto-save to memory (background)
-                from agents.memory_agent import memory_category
-                self.memory_agent.store(command, reply, memory_category(command))
+                # Safety — always reset if no reply
+                if not reply or not reply.strip():
+                    self.is_processing = False
+                    self.status_text = f"STANDBY_{self.current_lang.upper()}"
+                    return
 
-                # Switch character safely
+                # Switch character
                 try:
                     self.after(0, lambda a=agent: self._switch_character(a))
                 except Exception:
                     pass
 
+                # Speak first — don't wait for memory store
                 self.speak(reply, agent=agent)
+
+                # Auto-save to memory in background AFTER speaking starts
+                from agents.memory_agent import memory_category
+                threading.Thread(
+                    target=self.memory_agent.store,
+                    args=(command, reply, memory_category(command)),
+                    daemon=True
+                ).start()
 
             except Exception as e:
                 print(f"[Orchestrator] Error: {e}")
@@ -384,7 +395,7 @@ class OptimusApp(ctk.CTk):
                 self.after(0, lambda: self._switch_character("chat"))
             except Exception:
                 pass
-                self.is_processing = False
+            self.is_processing = False
             self.status_text   = f"STANDBY_{self.current_lang.upper()}"
 
         threading.Thread(target=_tts, daemon=True).start()
