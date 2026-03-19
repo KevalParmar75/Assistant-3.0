@@ -8,7 +8,7 @@ import pyautogui
 from state import AgentState
 
 CHARACTER = "optimus"
-MODEL     = "Qwen/Qwen2-VL-7B-Instruct"
+MODEL     = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 pyautogui.FAILSAFE = False
 

@@ -92,6 +92,32 @@ class Supervisor:
             return {**state, "active_agent": "chat",
                     "tool_name": "open_app", "tool_args": {"name": cmd_low}}
 
+        # ── Date/Time — always answer directly from system ──
+        if any(w in cmd_low for w in ["what time", "current time", "what's the time",
+                                       "what is the time", "what day", "what date",
+                                       "today's date", "what is today", "current date",
+                                       "day is it", "date is it", "time is it"]):
+            import datetime
+            now  = datetime.datetime.now()
+            time_str = now.strftime("%I:%M %p")
+            date_str = now.strftime("%A, %d %B %Y")
+            response = f"It's {time_str} on {date_str}."
+            return {**state, "active_agent": "chat",
+                    "tool_name": "direct", "tool_args": {"response": response}}
+
+        # ── Notes ──
+        if any(w in cmd_low for w in ["take a note", "note down", "write this down",
+                                       "add a note", "save a note", "jot down",
+                                       "read my notes", "show my notes", "what are my notes"]):
+            return {**state, "active_agent": "memory",
+                    "tool_name": "note", "tool_args": {"text": command}}
+
+        # ── WhatsApp ──
+        if any(w in cmd_low for w in ["whatsapp", "send a message", "send message",
+                                       "message to", "text to"]):
+            return {**state, "active_agent": "whatsapp",
+                    "tool_name": "whatsapp", "tool_args": {}}
+
         # ── Vision — screen awareness and clicking ──
         if any(w in cmd_low for w in ["what's on screen", "what do you see",
                                        "what's open", "describe screen",
@@ -255,7 +281,8 @@ class OptimusApp(ctk.CTk):
         self._update_lang_buttons()
 
         self._animate()
-        threading.Thread(target=self._listen_loop, daemon=True).start()
+        threading.Thread(target=self._listen_loop,      daemon=True).start()
+        threading.Thread(target=self._interrupt_listen, daemon=True).start()
 
     # ── Drag ──
     def _drag_start(self, e): self._dx, self._dy = e.x, e.y
@@ -285,15 +312,17 @@ class OptimusApp(ctk.CTk):
         workflow.add_node("memory",     self.memory_agent.run)
         workflow.add_node("reminder",   self.reminder_agent.run)
         workflow.add_node("vision",     self.vision_agent.run)
+        workflow.add_node("whatsapp",   self._whatsapp_node)
         workflow.set_entry_point("supervisor")
         workflow.add_conditional_edges(
             "supervisor",
             lambda s: s["active_agent"],
-            {"chat":    "chat",    "browser": "browser",
-             "code":    "code",    "memory":  "memory",
-             "reminder":"reminder", "vision": "vision"}
+            {"chat":    "chat",    "browser":   "browser",
+             "code":    "code",    "memory":    "memory",
+             "reminder":"reminder","vision":    "vision",
+             "whatsapp":"whatsapp"}
         )
-        for node in ["chat", "browser", "code", "memory", "reminder", "vision"]:
+        for node in ["chat", "browser", "code", "memory", "reminder", "vision", "whatsapp"]:
             workflow.add_edge(node, END)
         self.graph = workflow.compile()
 
@@ -368,6 +397,10 @@ class OptimusApp(ctk.CTk):
                 result = self.graph.invoke(initial_state, {"recursion_limit": 10})
                 agent  = result.get("active_agent", "chat")
                 reply  = result.get("response", "")
+
+                # Direct response — supervisor answered directly (e.g. time/date)
+                if not reply and result.get("tool_name") == "direct":
+                    reply = result.get("tool_args", {}).get("response", "")
 
                 # Safety — always reset if no reply
                 if not reply or not reply.strip():
@@ -445,6 +478,47 @@ class OptimusApp(ctk.CTk):
         threading.Thread(target=_tts, daemon=True).start()
 
     # ── Wake word listener ──
+    def _interrupt_listen(self):
+        """
+        Dedicated lightweight thread — only listens for 'stop' / 'hey stop'.
+        Runs even while Optimus is speaking.
+        """
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold         = 350
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold          = 0.4
+
+        STOP_WORDS = ["stop", "hey stop", "stop it", "quiet", "silence",
+                      "shut up", "enough", "cancel", "ruko", "bas"]
+
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("[Interrupt] Listening for stop word...")
+            while True:
+                try:
+                    # Only active when speaking or processing
+                    if self.status_text not in ("SPEAKING", "PROCESSING",
+                                                "BROWSING", "SEEING", "CODING"):
+                        time.sleep(0.3)
+                        continue
+
+                    audio = recognizer.listen(source, timeout=None,
+                                             phrase_time_limit=2)
+                    text  = recognizer.recognize_google(
+                        audio, language=LANG_CODES.get(self.current_lang, "en-IN")
+                    ).lower()
+
+                    if any(w in text for w in STOP_WORDS):
+                        print(f"[Interrupt] STOP detected: '{text}'")
+                        self.stop_speaking   = True
+                        self.is_processing   = False
+                        self.status_text     = f"STANDBY_{self.current_lang.upper()}"
+
+                except sr.WaitTimeoutError:
+                    pass
+                except Exception:
+                    time.sleep(0.2)
+
     def _listen_loop(self):
         recognizer = sr.Recognizer()
         recognizer.energy_threshold         = 300
@@ -532,6 +606,112 @@ class OptimusApp(ctk.CTk):
                 except Exception as e:
                     print(f"[Listen] Error: {e}")
                     time.sleep(0.5)
+
+
+    def _whatsapp_node(self, state: AgentState) -> AgentState:
+        """
+        WhatsApp — vision powered.
+        Opens WhatsApp Desktop, finds contact, types and sends message.
+        """
+        command  = state["command"]
+        lang_map = {"en": "English", "hi": "Hindi", "gu": "Gujarati"}
+        lang     = lang_map.get(state["language"], "English")
+
+        # Parse contact and message using LLM
+        from huggingface_hub import InferenceClient
+        import re as _re, json as _json
+        client = InferenceClient(token=os.getenv("HF_TOKEN"))
+        try:
+            parse_resp = client.chat_completion(
+                model="Qwen/Qwen2.5-72B-Instruct",
+                messages=[{
+                    "role": "user",
+                    "content": f"""Extract the contact name and message from this command: "{command}"
+Respond ONLY with JSON:
+{{"contact": "name", "message": "message text"}}"""
+                }],
+                max_tokens=100, temperature=0.1
+            )
+            raw     = _re.sub(r"```json|```", "",
+                              parse_resp.choices[0].message.content.strip()).strip()
+            parsed  = _json.loads(raw)
+            contact = parsed.get("contact", "")
+            message = parsed.get("message", "")
+        except Exception as e:
+            print(f"[WhatsApp] Parse failed: {e}")
+            return {**state, "response": "Couldn't understand who to message or what to say.",
+                    "active_agent": "whatsapp"}
+
+        if not contact or not message:
+            return {**state, "response": "Please tell me who to message and what to say.",
+                    "active_agent": "whatsapp"}
+
+        # Open WhatsApp Desktop
+        try:
+            from AppOpener import open as appopen
+            appopen("whatsapp", match_closest=True, output=False)
+            time.sleep(3)
+        except Exception as e:
+            print(f"[WhatsApp] Launch failed: {e}")
+            return {**state, "response": "Couldn't open WhatsApp.",
+                    "active_agent": "whatsapp"}
+
+        # Use vision to find search bar and contact
+        vision = self.vision_agent
+        vision.execute(f"click on the search bar or new chat icon in WhatsApp")
+        time.sleep(1)
+
+        # Type contact name
+        import pyautogui
+        pyautogui.typewrite(contact, interval=0.05)
+        time.sleep(1.5)
+
+        # Vision click on the contact
+        vision.execute(f"click on the contact named {contact} in the search results")
+        time.sleep(1)
+
+        # Type message
+        vision.execute("click on the message input box at the bottom")
+        time.sleep(0.5)
+        pyautogui.typewrite(message, interval=0.05)
+        time.sleep(0.5)
+        pyautogui.press("enter")
+
+        response = f"Message sent to {contact}."
+        self.memory_agent.store(command, response, "general")
+        return {**state, "response": response, "active_agent": "whatsapp"}
+
+    def _handle_notes(self, command: str) -> str:
+        """Save or read notes."""
+        import os
+        notes_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "memory", "notes.txt"
+        )
+        cmd = command.lower()
+
+        # Read notes
+        if any(w in cmd for w in ["read", "show", "what are", "list"]):
+            if os.path.exists(notes_file):
+                with open(notes_file, "r", encoding="utf-8") as f:
+                    notes = f.read().strip()
+                return f"Your notes: {notes}" if notes else "No notes saved yet."
+            return "No notes saved yet."
+
+        # Save note — strip trigger phrases
+        note_text = command
+        for phrase in ["take a note", "note down", "write this down",
+                       "add a note", "save a note", "jot down", "note that"]:
+            note_text = note_text.lower().replace(phrase, "").strip()
+
+        if note_text:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(notes_file, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] {note_text}\n")
+            # Also save to memory
+            self.memory_agent.store(command, f"Note saved: {note_text}", "general")
+            return f"Got it. Note saved: {note_text}"
+        return "What would you like me to note down?"
 
 
 if __name__ == "__main__":

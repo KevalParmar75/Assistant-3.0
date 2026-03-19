@@ -67,6 +67,12 @@ Respond ONLY with JSON. No explanation."""
 
     # ── LangGraph node ──
     def run(self, state: AgentState) -> AgentState:
+        # Direct response — no LLM needed (e.g. time/date)
+        if state.get("tool_name") == "direct":
+            return {**state,
+                    "response": state.get("tool_args", {}).get("response", ""),
+                    "active_agent": "chat"}
+
         command  = state["command"]
         language = state.get("language", "en")
         mem_ctx  = state.get("memory_context", "")

@@ -158,8 +158,43 @@ class MemoryAgent:
     # ── LangGraph node ──
     def run(self, state: AgentState) -> AgentState:
         from tools.registry import call_tool
+        import os, datetime
+
         tool_name = state.get("tool_name", "memory_recall")
-        tool_args = state.get("tool_args", {"query": state["command"]})
+        command   = state.get("command", "")
+
+        # ── Notes ──
+        if tool_name == "note":
+            notes_file = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "memory", "notes.txt"
+            )
+            cmd = command.lower()
+            # Read
+            if any(w in cmd for w in ["read", "show", "what are", "list"]):
+                if os.path.exists(notes_file):
+                    with open(notes_file, "r", encoding="utf-8") as f:
+                        notes = f.read().strip()
+                    result = f"Your notes: {notes}" if notes else "No notes saved yet."
+                else:
+                    result = "No notes saved yet."
+            else:
+                # Save
+                note_text = command
+                for phrase in ["take a note", "note down", "write this down",
+                               "add a note", "save a note", "jot down", "note that"]:
+                    note_text = note_text.lower().replace(phrase, "").strip()
+                if note_text:
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    with open(notes_file, "a", encoding="utf-8") as f:
+                        f.write(f"[{ts}] {note_text}\n")
+                    self.store(command, f"Note saved: {note_text}", "general")
+                    result = f"Got it. Note saved."
+                else:
+                    result = "What would you like me to note down?"
+            return {**state, "response": result, "active_agent": "memory"}
+
+        tool_args = state.get("tool_args", {"query": command})
         result    = call_tool(tool_name, tool_args)
         return {**state, "response": result, "active_agent": "memory"}
 
