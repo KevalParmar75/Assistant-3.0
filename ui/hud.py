@@ -4,7 +4,7 @@ Optimus = pixel art (default)
 All others = animated GIF
 """
 import tkinter as tk
-from PIL import Image, ImageTk
+from PIL import Image
 import os
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")

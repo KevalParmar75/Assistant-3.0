@@ -281,8 +281,23 @@ class OptimusApp(ctk.CTk):
         self._update_lang_buttons()
 
         self._animate()
-        threading.Thread(target=self._listen_loop,      daemon=True).start()
-        threading.Thread(target=self._interrupt_listen, daemon=True).start()
+        # Delay thread starts slightly to let mainloop stabilize
+        self.after(500, self._start_threads)
+
+    def _start_threads(self):
+        """Start background threads after mainloop is stable."""
+        threading.Thread(target=self._safe_listen_loop, daemon=True).start()
+        print("[Optimus] Background threads started.")
+
+    def _safe_listen_loop(self):
+        """Wrapper that prevents listen loop crashes from killing the app."""
+        time.sleep(1.0)  # extra delay — let mainloop fully stabilize
+        try:
+            self._listen_loop()
+        except Exception as e:
+            print(f"[Listen] Fatal error: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ── Drag ──
     def _drag_start(self, e): self._dx, self._dy = e.x, e.y
@@ -479,45 +494,44 @@ class OptimusApp(ctk.CTk):
 
     # ── Wake word listener ──
     def _interrupt_listen(self):
-        """
-        Dedicated lightweight thread — only listens for 'stop' / 'hey stop'.
-        Runs even while Optimus is speaking.
-        """
-        recognizer = sr.Recognizer()
-        recognizer.energy_threshold         = 350
-        recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold          = 0.4
+        """Dedicated thread — only listens for stop words while speaking."""
+        try:
+            recognizer = sr.Recognizer()
+            recognizer.energy_threshold         = 400
+            recognizer.dynamic_energy_threshold = False
+            recognizer.pause_threshold          = 0.4
 
-        STOP_WORDS = ["stop", "hey stop", "stop it", "quiet", "silence",
-                      "shut up", "enough", "cancel", "ruko", "bas"]
+            STOP_WORDS = ["stop", "hey stop", "stop it", "quiet", "silence",
+                          "shut up", "enough", "cancel", "ruko", "bas"]
 
-        with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            print("[Interrupt] Listening for stop word...")
-            while True:
-                try:
-                    # Only active when speaking or processing
-                    if self.status_text not in ("SPEAKING", "PROCESSING",
-                                                "BROWSING", "SEEING", "CODING"):
-                        time.sleep(0.3)
-                        continue
-
-                    audio = recognizer.listen(source, timeout=None,
-                                             phrase_time_limit=2)
-                    text  = recognizer.recognize_google(
-                        audio, language=LANG_CODES.get(self.current_lang, "en-IN")
-                    ).lower()
-
-                    if any(w in text for w in STOP_WORDS):
-                        print(f"[Interrupt] STOP detected: '{text}'")
-                        self.stop_speaking   = True
-                        self.is_processing   = False
-                        self.status_text     = f"STANDBY_{self.current_lang.upper()}"
-
-                except sr.WaitTimeoutError:
-                    pass
-                except Exception:
-                    time.sleep(0.2)
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                print("[Interrupt] Stop-word listener ready.")
+                while True:
+                    try:
+                        if self.status_text not in ("SPEAKING", "PROCESSING",
+                                                    "BROWSING", "SEEING", "CODING"):
+                            time.sleep(0.3)
+                            continue
+                        audio = recognizer.listen(source, timeout=2,
+                                                  phrase_time_limit=2)
+                        text  = recognizer.recognize_google(
+                            audio, language="en-IN"
+                        ).lower()
+                        if any(w in text for w in STOP_WORDS):
+                            print(f"[Interrupt] STOP: '{text}'")
+                            self.stop_speaking = True
+                            self.is_processing = False
+                            self.status_text   = f"STANDBY_{self.current_lang.upper()}"
+                    except sr.WaitTimeoutError:
+                        pass
+                    except sr.UnknownValueError:
+                        pass
+                    except Exception as e:
+                        print(f"[Interrupt] Error: {e}")
+                        time.sleep(0.5)
+        except Exception as e:
+            print(f"[Interrupt] Failed to start: {e}")
 
     def _listen_loop(self):
         recognizer = sr.Recognizer()
@@ -525,8 +539,17 @@ class OptimusApp(ctk.CTk):
         recognizer.dynamic_energy_threshold = True
         recognizer.pause_threshold          = 0.8
 
-        with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            print(f"[Listen] Microphone init failed: {e}")
+            return
+
+        with mic as source:
+            try:
+                recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            except Exception as e:
+                print(f"[Listen] Ambient noise adjust failed: {e}")
             print("[Optimus] Wake word mode — say 'Optimus' to activate.")
 
             active       = False
@@ -564,6 +587,16 @@ class OptimusApp(ctk.CTk):
                         except: continue
 
                     if not best_text:
+                        continue
+
+                    # ── Stop word — interrupt speaking/processing ──
+                    STOP_WORDS = ["stop", "hey stop", "stop it", "quiet",
+                                  "silence", "shut up", "enough", "cancel", "ruko", "bas"]
+                    if any(w in best_text for w in STOP_WORDS) and self.status_text == "SPEAKING":
+                        print(f"[Interrupt] STOP: '{best_text}'")
+                        self.stop_speaking = True
+                        self.is_processing = False
+                        self.status_text   = f"STANDBY_{self.current_lang.upper()}"
                         continue
 
                     is_wake = any(w in best_text for w in WAKE_WORDS)
